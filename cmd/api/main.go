@@ -1,8 +1,14 @@
 package main
 
+// SOURCE === source $HOME/.profile
+
 import (
+	"context"
+	"database/sql"
 	"flag"
 	"fmt"
+	_ "github.com/lib/pq"
+	"greenlight.lawrence.net/internal/data"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,6 +24,12 @@ const version = "1.0.0"
 type config struct {
 	port int
 	env  string
+	db   struct {
+		dsn          string
+		maxOpenConns int
+		maxIdleConns int
+		maxIdleTime  time.Duration
+	}
 }
 
 // Define an application struct to hold the dependencies for our HTTP handlers, helpers, // and middleware. At the moment this only contains a copy of the config struct and a
@@ -25,32 +37,45 @@ type config struct {
 type application struct {
 	config config
 	logger *slog.Logger
+	models data.Models
 }
 
 func main() {
-	// Declare an instance of the config struct.
 	var cfg config
 
-	// Read the value of the port and env command-line flags into the config struct. We // default to using the port number 4000 and the environment "development" if no
-	// corresponding flags are provided.
 	flag.IntVar(&cfg.port, "port", 4000, "API server port")
 	flag.StringVar(&cfg.env, "env", "development", "Environment (development|staging|production)")
+
+	flag.StringVar(&cfg.db.dsn, "db-dsn", os.Getenv("GREENLIGHT_DB_DSN"), "PostgreSQL DSN")
+
+	flag.IntVar(&cfg.db.maxOpenConns, "db-max-open-conns", 25, "PostgreSQL max open connections")
+	flag.IntVar(&cfg.db.maxIdleConns, "db-max-idle-conns", 25, "PostgreSQL max idle connections")
+	flag.DurationVar(&cfg.db.maxIdleTime, "db-max-idle-time", 15*time.Minute, "PostgreSQL max connection idle time")
+
 	flag.Parse()
 
-	// Initialize a new structured logger which writes log entries to the standard out // stream.
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	// Declare an instance of the application struct, containing the config struct and // the logger.
+	db, err := openDB(cfg)
+	if err != nil {
+		fmt.Println("i am here at the open db")
+		logger.Error(err.Error())
+		os.Exit(1)
+	}
+
+	defer db.Close()
+
+	logger.Info("database connection pool established")
+
 	app := &application{
 		config: cfg,
 		logger: logger,
+		models: data.NewModels(db),
 	}
 
-	// Declare a new servemux and add a /v1/healthcheck route which dispatches requests // to the healthcheckHandler method (which we will create in a moment).
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/healthcheck", app.healthcheckHandler)
 
-	// Declare a HTTP server which listens on the port provided in the config struct, // uses the servemux we created above as the handler, has some sensible timeout // settings and writes any log messages to the structured logger at Error level.
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.port),
 		Handler:      app.routes(),
@@ -63,8 +88,35 @@ func main() {
 	// Start the HTTP server.
 	logger.Info("starting server", "addr", srv.Addr, "env", cfg.env)
 
-	err := srv.ListenAndServe()
+	err = srv.ListenAndServe()
 	fmt.Println("the error ---- ", err.Error())
 	logger.Error(err.Error())
 	os.Exit(1)
+}
+
+func openDB(cfg config) (*sql.DB, error) {
+	db, err := sql.Open("postgres", cfg.db.dsn)
+	if err != nil {
+		fmt.Println("error at the sql open --- ", err)
+		return nil, err
+	}
+
+	db.SetMaxOpenConns(cfg.db.maxOpenConns)
+	db.SetMaxIdleConns(cfg.db.maxIdleConns)
+	db.SetConnMaxIdleTime(cfg.db.maxIdleTime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		fmt.Println("error at ping context --- ", err)
+		err := db.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, err
+	}
+
+	return db, nil
 }
